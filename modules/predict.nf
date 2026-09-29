@@ -28,6 +28,12 @@ process BOLTZ_PREDICT {
                         ? "--msa_server_url ${params.msa_server_url}" : ""
     def potentials    = params.use_potentials ? "--use_potentials" : ""
     """
+    # Reduces CUDA allocator fragmentation (not a VRAM-ceiling extension like
+    # AF3_PREDICT's unified-memory env vars since Boltz-2 is PyTorch-based, no
+    # JAX involved). Won't rescue a genuine over-capacity OOM, but is a safe,
+    # low-cost hedge against fragmentation-induced false OOMs.
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
     boltz predict ${yaml_file} \
         --out_dir boltz_out \
         --recycling_steps ${params.recycling_steps} \

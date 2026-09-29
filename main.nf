@@ -22,6 +22,7 @@
  *    3b. (AF3 path)       - A3M files used directly via unpairedMsaPath
  *    4. MAKE_BOLTZ_YAML / MAKE_AF3_JSON - assemble input per pair
  *    5. BOLTZ_PREDICT / AF3_PREDICT     - structure prediction (GPU)
+ *                           [skipped per-pair if published output exists]
  *    6. PARSE_METRICS     - extract confidence + pDockQ per pair
  *    7. RANK_PREDICTIONS  - aggregate and rank all pairs
  *
@@ -32,6 +33,14 @@
  *  MSA caching:
  *    If A3M files exist in params.alignments_dir/a3m/<prot_id>.a3m,
  *    MMSEQS_SEARCH is skipped for those proteins.
+ *
+ *  Structure caching (both predictors):
+ *    If <outdir>/structures_af3/<pair_id>/<pair_id>_summary_confidences.json
+ *    or <outdir>/structures_boltz2/<pair_id>/confidence_<pair_id>_model_0.json
+ *    already exists, AF3_PREDICT/BOLTZ_PREDICT is skipped for that
+ *    pair and the published output is reused directly. This mechanism
+ #    is insurance against redoing a prediction that completed on disk but
+ #    was orphaned by a Nextflow driver failure before it could be published.
  *
  *  When params.use_msa_server = true, stages 2-3 are skipped and
  *  Boltz-2 fetches MSAs from the MMseqs2 server at prediction time.
@@ -74,7 +83,6 @@ include { PARSE_METRICS; RANK_PREDICTIONS }  from './modules/rank'
 include { MAKE_AF3_JSON; AF3_PREDICT }  from './modules/predict_af3'
 include { PARSE_METRICS_AF3 }  from './modules/rank_af3'
 
-
 /*
  * Parse a multi-sequence FASTA file into a list of [id, sequence] pairs.
  * Used at workflow scope to identify unique proteins for MSA computation.
@@ -100,7 +108,6 @@ def parseFasta(fastaPath) {
     }
     return seqs
 }
-
 
 /*
  * Resolve an optional PTM CSV path.
@@ -138,7 +145,6 @@ def resolvePtmsCsv(explicitParam, fastaPath, conventionName) {
     return 'no_file'
 }
 
-
 workflow {
 
     // ---------------------------------------------------------------
@@ -169,7 +175,7 @@ workflow {
     // ---------------------------------------------------------------
     // Resolve optional PTM CSV files
     // ---------------------------------------------------------------
-    bait_ptms_path      = resolvePtmsCsv(params.bait_ptms, params.baits_fasta, 'bait_ptms.csv')
+    bait_ptms_path = resolvePtmsCsv(params.bait_ptms, params.baits_fasta, 'bait_ptms.csv')
     candidate_ptms_path = resolvePtmsCsv(params.candidate_ptms, params.candidates_fasta, 'candidate_ptms.csv')
 
     // ---------------------------------------------------------------
@@ -307,18 +313,40 @@ workflow {
         }
     }
 
-
     // ---------------------------------------------------------------
     // Stage 5: Structure prediction (GPU-bound)
     // ---------------------------------------------------------------
     if (predictor == 'boltz2') {
-        BOLTZ_PREDICT(predict_ch)
-        pred_results = BOLTZ_PREDICT.out.results
-    } else {
-        AF3_PREDICT(predict_ch)
-        pred_results = AF3_PREDICT.out.results
-    }
+        // --- Structure caching: skip pairs with an already-published Boltz-2
+        // result. Mirrors the AF3_PREDICT caching below and the
+        // alignments_dir MSA-caching pattern above.
+        predict_ch.branch {
+            cached:  file("${params.outdir}/structures_boltz2/${it[0]}/confidence_${it[0]}_model_0.json").exists()
+            compute: true
+        }.set { boltz_split_ch }
 
+        cached_boltz = boltz_split_ch.cached.map { pair_id, yaml_file, msa_csvs ->
+            tuple(pair_id, file("${params.outdir}/structures_boltz2/${pair_id}/*", glob: true))
+        }
+
+        BOLTZ_PREDICT(boltz_split_ch.compute)
+        pred_results = cached_boltz.mix(BOLTZ_PREDICT.out.results)
+    } else {
+        // --- Structure caching: skip pairs with an already-published
+        // result (e.g. a task that completed on disk but was orphaned by a
+        // killed/failed driver before Nextflow could record/publish it).
+        predict_ch.branch {
+            cached:  file("${params.outdir}/structures_af3/${it[0]}/${it[0]}_summary_confidences.json").exists()
+            compute: true
+        }.set { af3_split_ch }
+
+        cached_af3 = af3_split_ch.cached.map { pair_id, json_file, a3m_files ->
+            tuple(pair_id, file("${params.outdir}/structures_af3/${pair_id}/*", glob: true))
+        }
+
+        AF3_PREDICT(af3_split_ch.compute)
+        pred_results = cached_af3.mix(AF3_PREDICT.out.results)
+    }
 
     // ---------------------------------------------------------------
     // Stage 6: Parse metrics per pair (pDockQ + confidence)
@@ -331,13 +359,11 @@ workflow {
         all_metrics = PARSE_METRICS_AF3.out.metrics.collect()
     }
 
-
     // ---------------------------------------------------------------
     // Stage 7: Aggregate and rank all predictions
     // ---------------------------------------------------------------
     RANK_PREDICTIONS(all_metrics)
 }
-
 
 workflow.onComplete {
     log.info """

@@ -71,6 +71,13 @@ process AF3_PREDICT {
         cp -L \$f staging/
     done
 
+    # The two settings below can reduce HBM2e overruns: lets JAX/XLA
+    # spill GPU memory into host RAM via CUDA unified memory once a
+    # complex's working set exceeds the GPU's physical VRAM, instead of
+    # crashing outright.
+    export TF_FORCE_UNIFIED_MEMORY=1
+    export XLA_CLIENT_MEM_FRACTION=4
+
     singularity run \
         --nv \
         -B \${PWD}/staging:/af3_work \
