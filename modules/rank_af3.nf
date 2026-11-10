@@ -26,79 +26,17 @@ process PARSE_METRICS_AF3 {
     script:
     """
     #!/usr/bin/env python3
-    import json, glob, math, re, sys, os
+    import json, glob, math, re, sys, os, shutil
     import numpy as np
 
     pair_id = "${pair_id}"
 
-    # =====================================================================
-    # Helper: parse one CIF and return pDockQ, n_contacts, avg_if_plddt
-    # =====================================================================
-    def compute_pdockq(cif_path):
-        atoms = []
-        in_atom_site = False
-        columns = []
-        with open(cif_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("_atom_site."):
-                    in_atom_site = True
-                    columns.append(line.split(".")[1].strip())
-                    continue
-                if in_atom_site and (line.startswith("_") or line.startswith("#") or line.startswith("loop_")):
-                    in_atom_site = False
-                    if line.startswith("loop_"):
-                        columns = []
-                    continue
-                if in_atom_site and columns and not line.startswith("_"):
-                    tokens = line.split()
-                    if len(tokens) < len(columns):
-                        continue
-                    rec = dict(zip(columns, tokens))
-                    if rec.get("group_PDB") != "ATOM":
-                        continue
-                    try:
-                        atoms.append({
-                            "atom": rec.get("label_atom_id",""),
-                            "chain": rec.get("label_asym_id",""),
-                            "resi": int(rec.get("label_seq_id","0")),
-                            "x": float(rec.get("Cartn_x","0")),
-                            "y": float(rec.get("Cartn_y","0")),
-                            "z": float(rec.get("Cartn_z","0")),
-                            "b": float(rec.get("B_iso_or_equiv","0")),
-                        })
-                    except (ValueError, KeyError):
-                        pass
-
-        ca, cb = {}, {}
-        for a in atoms:
-            k = (a["chain"], a["resi"])
-            if a["atom"] == "CA": ca[k] = (a["x"],a["y"],a["z"],a["b"])
-            elif a["atom"] == "CB": cb[k] = (a["x"],a["y"],a["z"],a["b"])
-        rep = {k: cb.get(k, ca[k]) for k in ca}
-
-        chains = sorted(set(k[0] for k in rep))
-        if len(chains) < 2:
-            return None, 0, 0.0
-        ra = {k:v for k,v in rep.items() if k[0]==chains[0]}
-        rb = {k:v for k,v in rep.items() if k[0]==chains[1]}
-        if not ra or not rb:
-            return None, 0, 0.0
-        ca_ = np.array([[v[0],v[1],v[2]] for v in ra.values()])
-        cb_ = np.array([[v[0],v[1],v[2]] for v in rb.values()])
-        pa = np.array([v[3] for v in ra.values()])
-        pb = np.array([v[3] for v in rb.values()])
-        d = np.sqrt(np.sum((ca_[:,None,:]-cb_[None,:,:])**2, axis=2))
-        mask = d < 10.0
-        n_contacts = int(np.sum(mask))
-        if n_contacts == 0:
-            return None, 0, 0.0
-        ai = np.any(mask, axis=1)
-        bi = np.any(mask, axis=0)
-        avg_if_plddt = float(np.mean(np.concatenate([pa[ai],pb[bi]])))
-        x = avg_if_plddt * math.log10(n_contacts)
-        pdockq = 0.724/(1+math.exp(-0.052*(x-152.611)))+0.018
-        return pdockq, n_contacts, avg_if_plddt
+    # pDockQ comes from bin/compute_pdockq.py.
+    _p = shutil.which("compute_pdockq.py")
+    if _p is None:
+        sys.exit("compute_pdockq.py not found on PATH -- is bin/ present?")
+    sys.path.insert(0, os.path.dirname(_p))
+    from compute_pdockq import compute_pdockq
 
     # =====================================================================
     # Collect per-sample metrics from AF3 output
@@ -195,5 +133,13 @@ process PARSE_METRICS_AF3 {
           f"+/- {np.std(sample_vals['iptm'], ddof=0):.4f}"
           if sample_vals['iptm'] else f"{pair_id}: no confidence data",
           file=sys.stderr)
+    """
+
+    stub:
+    // Minimal placeholder, not a duplicate of the embedded Python parser
+    // above. This just satisfies the declared output for wiring checks.
+    """
+    printf "pair_id\\tn_samples\\tconfidence_score_mean\\tconfidence_score_std\\n" > ${pair_id}.metrics.tsv
+    printf "${pair_id}\\t1\\t0.5\\tNA\\n" >> ${pair_id}.metrics.tsv
     """
 }

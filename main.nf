@@ -4,84 +4,128 @@
  *                 or AlphaFold 3
  * =========================================================================
  *
- *  Analogous to AlphaPulldown (see D. Yu et al. Bioinformatics 39, 2023,
- *  btac749) but using Boltz-2 (cite S. Passaro et al. bioRxiv, 2025,
- *  DOI:10.1101/2025.06.14.659707) or AlphaFold 3 (cite J. Abramson et al.
- *  Nature 630, 2024, 493-500) for structure prediction.
- *
- *  Input:  two multi-sequence FASTA files (baits and candidates)
+ *  Input:  either a bait FASTA + candidate FASTA (cross-product mode), or a
+ *          list of pairs + one sequence FASTA (pair-list mode, --pairs_tsv).
  *  Output: ranked table of predicted complex structures with confidence
  *          metrics (ipTM, pDockQ, pLDDT, pTM), plus per-pair structure
- *          subdirectories under results/structures/
+ *          subdirectories under results/structures_boltz2/ or
+ *          results/structures_af3/ depending on the predictor.
  *
  *  Pipeline stages:
- *    1. GENERATE_PAIRS    - enumerate bait x candidate combinations
- *    2. MMSEQS_SEARCH     - compute MSAs per unique protein (CPU)
- *                           [skipped if pre-computed A3Ms exist]
- *    3a. A3M_TO_BOLTZ_CSV - convert a3m to Boltz-2 paired CSV format
- *    3b. (AF3 path)       - A3M files used directly via unpairedMsaPath
- *    4. MAKE_BOLTZ_YAML / MAKE_AF3_JSON - assemble input per pair
- *    5. BOLTZ_PREDICT / AF3_PREDICT     - structure prediction (GPU)
- *                           [skipped per-pair if published output exists]
- *    6. PARSE_METRICS     - extract confidence + pDockQ per pair
- *    7. RANK_PREDICTIONS  - aggregate and rank all pairs
+ *    1. GENERATE_PAIRS - build the pair list. Cross-product mode enumerates
+ *                        bait x candidate; pair-list mode takes only the
+ *                        pairs named in --pairs_tsv. Either way pairs are
+ *                        collapsed on tuple(sorted((a,b))), since A_with_B
+ *                        and B_with_A are the same complex (a no-op when the
+ *                        bait and candidate sets are disjoint).
+ *
+ *    2a. (Boltz-2 local MSA, use_msa_server=false)
+ *        MSA_SEARCH_DB_BOLTZ2 - UniRef30 search per unique protein (CPU),
+ *        then (only if params.use_env=true) MSA_SEARCH_ENV_BOLTZ2 (to
+ *        include env/metagenomic search, then MERGE_TAXONOMY_BOLTZ2 (i.e.
+ *        a merge + taxonomy-ID tagging into the final per-protein CSVs
+ *        (see modules/search_msa_boltz2.nf).
+ *
+ *    2b. (AF3-native MSA, predictor=alphafold3)
+ *        MSA_SEARCH_DB - one task per unpaired database (UniRef90, MGnify,
+ *        Small BFD), then MERGE_AF3_NATIVE_MSA: merge with exact-duplicate
+ *        removal into one unpaired a3m per protein. Separately,
+ *        MSA_SEARCH_UNIPROT_PAIRED builds the PAIRED a3m from UniProt, which
+ *        AF3 keeps distinct from the unpaired MSA and uses for cross-chain
+ *        species matching (see modules/search_msa_af3.nf).
+ *
+ *    3. MAKE_BOLTZ_YAML / MAKE_AF3_JSON - assemble input per pair
+ *    4. BOLTZ_PREDICT / AF3_PREDICT     - structure prediction (GPU)
+ *    5. PARSE_METRICS / PARSE_METRICS_AF3 - confidence + pDockQ per pair
+ *                        (pDockQ via bin/compute_pdockq.py, shared by both)
+ *    6. RANK_PREDICTIONS - aggregate and rank all pairs
  *
  *  Predictor selection:
  *    --predictor boltz2       (default)
  *    --predictor alphafold3
  *
- *  MSA caching:
- *    If A3M files exist in params.alignments_dir/a3m/<prot_id>.a3m,
- *    MMSEQS_SEARCH is skipped for those proteins.
+ *  MSA caching: NOTE the two predictors cache different files:
+ *    predictor=boltz2 caches per-protein CSVs at
+ *      params.alignments_dir_boltz2/csv/<prot_id>.csv
+ *    There is no a3m-level cache for Boltz-2: taxonomy tagging happens in
+ *    the same task as the search, so no intermediate a3m is worth keeping.
+ *    predictor=alphafold3 caches per-protein a3m files at
+ *      params.alignments_dir_af3/a3m/<prot_id>.a3m
+ *      params.alignments_dir_af3/paired_a3m/<prot_id>.paired.a3m
+ *    A protein whose footprint already exists skips its search entirely.
+ *    Boltz-2 and AF3 use separate alignment directories: they were trained
+ *    on different MSA lineages, so a shared directory is not a neutral cache.
  *
- *  Structure caching (both predictors):
- *    If <outdir>/structures_af3/<pair_id>/<pair_id>_summary_confidences.json
- *    or <outdir>/structures_boltz2/<pair_id>/confidence_<pair_id>_model_0.json
- *    already exists, AF3_PREDICT/BOLTZ_PREDICT is skipped for that
- *    pair and the published output is reused directly. This mechanism
- #    is insurance against redoing a prediction that completed on disk but
- #    was orphaned by a Nextflow driver failure before it could be published.
- *
- *  When params.use_msa_server = true, stages 2-3 are skipped and
- *  Boltz-2 fetches MSAs from the MMseqs2 server at prediction time.
+ *  When params.use_msa_server = true, stage 2a is skipped and Boltz-2
+ *  fetches MSAs from the ColabFold API at prediction time.
  *  (Only valid with predictor = boltz2.)
  *
  *  Post-translational modifications (optional):
- *    Place bait_ptms.csv and/or candidate_ptms.csv in the same directory
- *    as the FASTA files, or specify paths explicitly via --bait_ptms and
- *    --candidate_ptms.  CSV format:
- *      protein_id,position,ccd
- *      BAIT1_GFP,18,SEP
+ *    Place ptms.tsv in the same directory as the sequence FASTA, or specify
+ *    it explicitly via --ptms. Modifications are resolved by protein ID, so
+ *    one table covers both chains of every pair.  Format (tab or comma):
+ *      protein_id	position	ccd
+ *      BAIT1_GFP	18	SEP
  *
  *  Usage:
- *    # Boltz-2 (default) on a Slurm cluster with GPUs
- *    nextflow run main.nf -profile slurm \
- *      --baits_fasta inputs/sequences/baits.fasta \
- *      --candidates_fasta inputs/sequences/candidates.fasta \
- *      --mmseqs_db /path/to/uniref90
- *
- *    # AlphaFold 3
- *    nextflow run main.nf -profile slurm \
- *      --predictor alphafold3 \
+ *    # Boltz-2 (default), API-based MSA (use_msa_server=true is the default
+ *    # and recommended unless running a large all-vs-all screen, see
+ *    # boltz2_uniref30_db/taxonomy_rdb in nextflow.config for the local-MSA
+ *    # alternative)
+ *    nextflow run main.nf \
  *      --baits_fasta inputs/sequences/baits.fasta \
  *      --candidates_fasta inputs/sequences/candidates.fasta
  *
- *    # Skip MSA computation (use pre-computed alignments)
- *    nextflow run main.nf -profile slurm \
+ *    # Boltz-2, local MSA mode (no public API dependency and recommended for
+ *    # large all-vs-all screens; see modules/search_msa_boltz2.nf). UniRef30
+ *    # search only by default (params.use_env=false, see nextflow.config
+ *    # for why); add --use_env true --boltz2_envdb_db /path/to/envdb to
+ *    # also run the env/metagenomic search, at the cost of a scarce
+ *    # bigmem-class node allocation.
+ *    nextflow run main.nf \
+ *      --baits_fasta inputs/sequences/baits.fasta \
+ *      --candidates_fasta inputs/sequences/candidates.fasta \
+ *      --use_msa_server false \
+ *      --boltz2_uniref30_db /path/to/uniref30_2302_db \
+ *      --taxonomy_rdb /path/to/taxonomy.rdb
+ *
+ *    # AlphaFold 3 (use_msa_server is not supported here: AF3 always uses
+ *    # the locally built AF3-native MSAs of stage 2b)
+ *    nextflow run main.nf \
  *      --predictor alphafold3 \
- *      --alignments_dir results/alignments
+ *      --use_msa_server false \
+ *      --baits_fasta inputs/sequences/baits.fasta \
+ *      --candidates_fasta inputs/sequences/candidates.fasta
+ *
+ *    # Pair-list mode: predict ONLY the pairs named in a file, e.g. to add a
+ *    # structure-based ranking to PPIs reported by proteomics. The first two
+ *    # columns are protein IDs (header auto-detected); --sequences_fasta must
+ *    # hold every protein the list names. baits_fasta/candidates_fasta are
+ *    # ignored.
+ *    nextflow run main.nf \
+ *      --pairs_tsv ms_hits.tsv \
+ *      --sequences_fasta all_proteins.fasta
+ *
+ *    # Reuse pre-computed alignments (skips the MSA stage for any protein
+ *    # whose cache is already present, see "MSA caching" above)
+ *    nextflow run main.nf \
+ *      --predictor alphafold3 \
+ *      --use_msa_server false \
+ *      --alignments_dir_af3 results/alignments_af3
  * =========================================================================
  */
 
 nextflow.enable.dsl = 2
 
 // --- Module imports ---
-include { MMSEQS_SEARCH; A3M_TO_BOLTZ_CSV }  from './modules/search_msa'
-include { GENERATE_PAIRS; MAKE_BOLTZ_YAML; MAKE_BOLTZ_YAML_NO_MSA }  from './modules/prepare_input'
-include { BOLTZ_PREDICT }  from './modules/predict'
-include { PARSE_METRICS; RANK_PREDICTIONS }  from './modules/rank'
-include { MAKE_AF3_JSON; AF3_PREDICT }  from './modules/predict_af3'
-include { PARSE_METRICS_AF3 }  from './modules/rank_af3'
+include { MSA_SEARCH_DB_BOLTZ2; MSA_SEARCH_ENV_BOLTZ2; MERGE_TAXONOMY_BOLTZ2 }                 from './modules/search_msa_boltz2'
+include { MSA_SEARCH_DB; MERGE_AF3_NATIVE_MSA; MSA_SEARCH_UNIPROT_PAIRED }                     from './modules/search_msa_af3'
+include { GENERATE_PAIRS; MAKE_BOLTZ_YAML; MAKE_BOLTZ_YAML_NO_MSA }   from './modules/prepare_input'
+include { BOLTZ_PREDICT }                                              from './modules/predict_boltz2'
+include { PARSE_METRICS; RANK_PREDICTIONS }                            from './modules/rank'
+include { MAKE_AF3_JSON; AF3_PREDICT }                                 from './modules/predict_af3'
+include { PARSE_METRICS_AF3 }                                          from './modules/rank_af3'
+
 
 /*
  * Parse a multi-sequence FASTA file into a list of [id, sequence] pairs.
@@ -109,39 +153,46 @@ def parseFasta(fastaPath) {
     return seqs
 }
 
+
 /*
- * Resolve an optional PTM CSV path.
+ * Resolve the PTM table for this run.
+ *
+ * ONE ID-keyed table, conventionally ptms.tsv:
+ *   protein_id<TAB>position<TAB>ccd
+ * Tab- or comma-separated. Resolution by protein ID alone, never
+ * by whether a protein is the bait or the candidate of a given pair.
  *
  * Priority:
- *   1. Explicit parameter (--bait_ptms / --candidate_ptms)
- *   2. Convention: <conventionName> in the same directory as the FASTA
- *   3. No PTMs (returns 'no_file' sentinel)
- *
- * Returns a path string suitable for passing to make_boltz_yaml.py.
+ *   1. Explicit --ptms
+ *   2. Convention: ptms.tsv, then ptms.csv, beside the FASTA that defines
+ *      this run's proteins (sequences_fasta in pair-list mode, otherwise
+ *      baits_fasta)
+ *   3. No PTMs ('no_file' sentinel)
  */
-def resolvePtmsCsv(explicitParam, fastaPath, conventionName) {
-    // 1. Explicit parameter
-    if (explicitParam != null) {
-        def f = file(explicitParam)
-        if (f.exists()) {
-            log.info "PTM CSV (explicit): ${f}"
-            return f
-        } else {
-            log.warn "PTM CSV specified but not found: ${explicitParam}"
-            return 'no_file'
+def resolvePtms(primaryFasta) {
+    // 1. Explicit
+    if (params.ptms != null) {
+        def f = file(params.ptms)
+        if (!f.exists()) {
+            error "ptms file not found: ${params.ptms}"
+        }
+        log.info "PTM table (explicit): ${f}"
+        return f.toString()
+    }
+
+    // 2. Convention
+    if (primaryFasta != null) {
+        def dir = file(primaryFasta).parent
+        for (name in ['ptms.tsv', 'ptms.csv']) {
+            def p = dir.resolve(name)
+            if (p.exists()) {
+                log.info "PTM table (auto-detected): ${p}"
+                return p.toString()
+            }
         }
     }
-    // 2. Convention: role-specific CSV alongside the FASTA
-    if (fastaPath == null) {
-        return 'no_file'
-    }
-    def fastaDir = file(fastaPath).parent
-    def conventionPath = fastaDir.resolve(conventionName)
-    if (conventionPath.exists()) {
-        log.info "PTM CSV (auto-detected): ${conventionPath}"
-        return conventionPath
-    }
-    // 3. No PTMs
+
+    // 3. None
     return 'no_file'
 }
 
@@ -155,9 +206,16 @@ workflow {
         error "Invalid predictor '${params.predictor}'. Choose 'boltz2' or 'alphafold3'."
     }
     if (predictor == 'alphafold3' && params.use_msa_server) {
-        error "use_msa_server is not supported with predictor=alphafold3. " +
-              "Provide pre-computed MSAs or use local mmseqs2 search."
+        error "use_msa_server is not supported with predictor=alphafold3 " +
+              "(it fetches Boltz-2-lineage MSAs from the ColabFold API; AF3 " +
+              "needs its own AF3-native MSAs). Pass --use_msa_server false. " +
+              "Note -profile test sets it true, so that profile needs the " +
+              "override explicitly."
     }
+
+    // Backend-specific alignments directory: Boltz-2 and AF3 were trained
+    // on different MSA lineages, so they don't share a cache.
+    def alignments_dir = (predictor == 'alphafold3') ? params.alignments_dir_af3 : params.alignments_dir_boltz2
 
     log.info """
     =========================================================================
@@ -166,7 +224,7 @@ workflow {
     Predictor    : ${predictor}
     Baits        : ${params.baits_fasta}
     Candidates   : ${params.candidates_fasta}
-    Alignments   : ${params.alignments_dir}
+    Alignments   : ${alignments_dir}
     MSA server   : ${params.use_msa_server}
     Output       : ${params.outdir}
     =========================================================================
@@ -175,14 +233,42 @@ workflow {
     // ---------------------------------------------------------------
     // Resolve optional PTM CSV files
     // ---------------------------------------------------------------
-    bait_ptms_path = resolvePtmsCsv(params.bait_ptms, params.baits_fasta, 'bait_ptms.csv')
-    candidate_ptms_path = resolvePtmsCsv(params.candidate_ptms, params.candidates_fasta, 'candidate_ptms.csv')
+    // The "primary" FASTA is whichever file defines this run's protein set:
+    // sequences_fasta in pair-list mode, baits_fasta otherwise.
+    ptms_path = resolvePtms(params.pairs_tsv ? params.sequences_fasta : params.baits_fasta)
 
     // ---------------------------------------------------------------
-    // Stage 1: Generate all bait x candidate pairs
+    // Stage 1: Build the pair list
+    //
+    // Cross-product mode (default): every bait x candidate pair.
+    // Pair-list mode (--pairs_tsv): only the pairs named in that file,
+    // with sequences drawn from --sequences_fasta. Intended for adding a
+    // structure-based ranking to an experimental edge list (e.g. PPIs
+    // reported by proteomics) rather than enumerating a cross product.
+    //
+    // Both modes feed GENERATE_PAIRS the same two path inputs, so the
+    // process signature and every downstream stage are unchanged.
     // ---------------------------------------------------------------
-    baits_ch      = Channel.fromPath(params.baits_fasta)
-    candidates_ch = Channel.fromPath(params.candidates_fasta)
+    if (params.pairs_tsv) {
+        def pairs_file = file(params.pairs_tsv)
+        if (!pairs_file.exists()) {
+            error "pairs_tsv not found: ${params.pairs_tsv}"
+        }
+        if (!params.sequences_fasta) {
+            error "--pairs_tsv requires --sequences_fasta (a FASTA holding every protein the pair list names)."
+        }
+        def seqs_file = file(params.sequences_fasta)
+        if (!seqs_file.exists()) {
+            error "sequences_fasta not found: ${params.sequences_fasta}"
+        }
+        log.info "Pair-list mode: ${pairs_file} against ${seqs_file}"
+        baits_ch      = Channel.fromPath(params.pairs_tsv)
+        candidates_ch = Channel.fromPath(params.sequences_fasta)
+    }
+    else {
+        baits_ch      = Channel.fromPath(params.baits_fasta)
+        candidates_ch = Channel.fromPath(params.candidates_fasta)
+    }
 
     GENERATE_PAIRS(baits_ch, candidates_ch)
 
@@ -206,8 +292,7 @@ workflow {
 
         predict_ch = MAKE_BOLTZ_YAML_NO_MSA(
             pairs_ch,
-            bait_ptms_path,
-            candidate_ptms_path
+            ptms_path
         ).yaml
             .map { pair_id, yaml_file -> tuple(pair_id, yaml_file, []) }
 
@@ -227,40 +312,98 @@ workflow {
         unique_proteins_ch = Channel.from(all_seqs)
             .map { entry -> tuple(entry[0], entry[1]) }
 
-        // --- MSA caching: split into cached vs. need-to-compute ---
-        unique_proteins_ch.branch {
-            cached:  file("${params.alignments_dir}/a3m/${it[0]}.a3m").exists()
-            compute: true
-        }.set { split_ch }
+        // Stage 2: MSA search for proteins without cached MSAs (CPU-bound).
+        // predictor=alphafold3 uses the AF3-native 4-DB search,
+        // caching per-protein a3m files; predictor=boltz2 uses
+        // the ColabFold-lineage single-DB search + taxonomy tagging,
+        // caching per-protein CSV files directly.
+        if (predictor == 'alphafold3') {
+            // --- MSA caching: split into cached vs. need-to-compute ---
+            unique_proteins_ch.branch {
+                cached:  file("${alignments_dir}/a3m/${it[0]}.a3m").exists()
+                compute: true
+            }.set { split_ch }
 
-        // Use cached A3M files directly
-        cached_a3m = split_ch.cached.map { prot_id, seq ->
-            tuple(prot_id, file("${params.alignments_dir}/a3m/${prot_id}.a3m"))
-        }
+            // Use cached A3M files directly
+            cached_a3m = split_ch.cached.map { prot_id, seq ->
+                tuple(prot_id, file("${alignments_dir}/a3m/${prot_id}.a3m"))
+            }
 
-        // Stage 2: MSA search for proteins without cached A3Ms (CPU-bound)
-        MMSEQS_SEARCH(split_ch.compute)
+            // Batch proteins needing search into fixed-size groups before
+            // invoking MSA_SEARCH_DB.
+            db_ch = Channel.from(params.af3_native_dbs)
+            batched_compute_ch = split_ch.compute.collate(params.af3_native_batch_size).map { batch -> [batch] }
+            search_input_ch = batched_compute_ch.combine(db_ch)
 
-        // Merge cached + newly computed A3M streams
-        all_a3m = cached_a3m.mix(MMSEQS_SEARCH.out.a3m)
+            MSA_SEARCH_DB(search_input_ch)
+            per_protein_a3m_ch = MSA_SEARCH_DB.out.a3m_files
+                .flatten()
+                .map { f -> tuple(f.name.tokenize('.')[0], f) }
+                .groupTuple()
 
-        // --- Branch by predictor ---
-        if (predictor == 'boltz2') {
+            MERGE_AF3_NATIVE_MSA(per_protein_a3m_ch)
+            computed_a3m = MERGE_AF3_NATIVE_MSA.out.a3m
 
-            // Stage 3: Convert a3m -> Boltz-2 CSV with pairing keys
-            // Also check for cached CSV files
-            all_a3m.branch {
-                cached:  file("${params.alignments_dir}/csv/${it[0]}.csv").exists()
+            // Merge cached + newly computed A3M streams
+            all_a3m = cached_a3m.mix(computed_a3m)
+
+            // Paired MSA (UniProt only): independent cache check, since this
+            // is a separate type from the unpaired a3m above.
+            unique_proteins_ch.branch {
+                cached:  file("${alignments_dir}/paired_a3m/${it[0]}.paired.a3m").exists()
+                compute: true
+            }.set { paired_split_ch }
+
+            cached_paired_msa = paired_split_ch.cached.map { prot_id, seq ->
+                tuple(prot_id, file("${alignments_dir}/paired_a3m/${prot_id}.paired.a3m"))
+            }
+
+            // Same batching as the unpaired search above.
+            batched_paired_compute_ch = paired_split_ch.compute.collate(params.af3_native_batch_size)
+            MSA_SEARCH_UNIPROT_PAIRED(batched_paired_compute_ch)
+
+            computed_paired_msa = MSA_SEARCH_UNIPROT_PAIRED.out.a3m_files
+                .flatten()
+                .map { f -> tuple(f.name.tokenize('.')[0], f) }
+
+            all_paired_msa = cached_paired_msa.mix(computed_paired_msa)
+        } else {
+            // predictor == 'boltz2', local MSA mode (use_msa_server=false)
+
+            // --- CSV caching: split into cached vs. need-to-compute ---
+            // (CSV, not a3m, see the comment above this if/else for why
+            // this predictor caches at the CSV level directly.)
+            unique_proteins_ch.branch {
+                cached:  file("${alignments_dir}/csv/${it[0]}.csv").exists()
                 compute: true
             }.set { csv_split_ch }
 
-            cached_csv = csv_split_ch.cached.map { prot_id, a3m ->
-                tuple(prot_id, file("${params.alignments_dir}/csv/${prot_id}.csv"))
+            cached_csv = csv_split_ch.cached.map { prot_id, seq ->
+                tuple(prot_id, file("${alignments_dir}/csv/${prot_id}.csv"))
             }
 
-            A3M_TO_BOLTZ_CSV(csv_split_ch.compute)
+            batched_compute_ch = csv_split_ch.compute.collate(params.boltz2_batch_size)
+            MSA_SEARCH_DB_BOLTZ2(batched_compute_ch)
 
-            all_csv = cached_csv.mix(A3M_TO_BOLTZ_CSV.out.csv)
+            if (params.use_env) {
+                MSA_SEARCH_ENV_BOLTZ2(MSA_SEARCH_DB_BOLTZ2.out.uniref_result)
+                merge_input_ch = MSA_SEARCH_ENV_BOLTZ2.out.env_result
+            } else {
+                no_env_file = file("${projectDir}/assets/NO_ENV")
+                merge_input_ch = MSA_SEARCH_DB_BOLTZ2.out.uniref_result
+                    .map { batch, qdb, prof_res, uniref_a3m -> tuple(batch, qdb, uniref_a3m, no_env_file) }
+            }
+            MERGE_TAXONOMY_BOLTZ2(merge_input_ch)
+
+            computed_csv = MERGE_TAXONOMY_BOLTZ2.out.csv_files
+                .flatten()
+                .map { f -> tuple(f.name.tokenize('.')[0], f) }
+
+            all_csv = cached_csv.mix(computed_csv)
+        }
+
+        // --- Branch by predictor ---
+        if (predictor == 'boltz2') {
 
             // Stage 4: Join MSA CSVs with bait-candidate pairs
             pairs_with_bait_msa = pairs_ch
@@ -280,73 +423,51 @@ workflow {
 
             predict_ch = MAKE_BOLTZ_YAML(
                 pairs_with_both_msa,
-                bait_ptms_path,
-                candidate_ptms_path
+                ptms_path
             ).yaml_with_msa
                 .map { pair_id, yaml, bait_csv, cand_csv -> tuple(pair_id, yaml, [bait_csv, cand_csv]) }
 
         } else {
             // predictor == 'alphafold3'
 
-            // Stage 4: Join A3M files with bait-candidate pairs
+            // Stage 4: Join unpaired + paired A3M files with bait-candidate pairs
             pairs_with_bait_msa = pairs_ch
                 .map { pair_id, bait_id, bait_seq, candidate_id, candidate_seq ->
                     tuple(bait_id, pair_id, bait_seq, candidate_id, candidate_seq)
                 }
                 .combine(all_a3m, by: 0)
-                .map { bait_id, pair_id, bait_seq, candidate_id, candidate_seq, bait_a3m ->
-                    tuple(candidate_id, pair_id, bait_id, bait_seq, candidate_seq, bait_a3m)
+                .combine(all_paired_msa, by: 0)
+                .map { bait_id, pair_id, bait_seq, candidate_id, candidate_seq, bait_a3m, bait_paired_msa ->
+                    tuple(candidate_id, pair_id, bait_id, bait_seq, candidate_seq, bait_a3m, bait_paired_msa)
                 }
 
             pairs_with_both_msa = pairs_with_bait_msa
                 .combine(all_a3m, by: 0)
-                .map { candidate_id, pair_id, bait_id, bait_seq, candidate_seq, bait_a3m, candidate_a3m ->
-                    tuple(pair_id, bait_id, bait_seq, candidate_id, candidate_seq, bait_a3m, candidate_a3m)
+                .combine(all_paired_msa, by: 0)
+                .map { candidate_id, pair_id, bait_id, bait_seq, candidate_seq, bait_a3m, bait_paired_msa, candidate_a3m, candidate_paired_msa ->
+                    tuple(pair_id, bait_id, bait_seq, candidate_id, candidate_seq, bait_a3m, candidate_a3m, bait_paired_msa, candidate_paired_msa)
                 }
 
             predict_ch = MAKE_AF3_JSON(
                 pairs_with_both_msa,
-                bait_ptms_path,
-                candidate_ptms_path
+                ptms_path
             ).json_with_msa
                 .map { pair_id, json_file, a3m_files -> tuple(pair_id, json_file, a3m_files) }
         }
     }
 
+
     // ---------------------------------------------------------------
     // Stage 5: Structure prediction (GPU-bound)
     // ---------------------------------------------------------------
     if (predictor == 'boltz2') {
-        // --- Structure caching: skip pairs with an already-published Boltz-2
-        // result. Mirrors the AF3_PREDICT caching below and the
-        // alignments_dir MSA-caching pattern above.
-        predict_ch.branch {
-            cached:  file("${params.outdir}/structures_boltz2/${it[0]}/confidence_${it[0]}_model_0.json").exists()
-            compute: true
-        }.set { boltz_split_ch }
-
-        cached_boltz = boltz_split_ch.cached.map { pair_id, yaml_file, msa_csvs ->
-            tuple(pair_id, file("${params.outdir}/structures_boltz2/${pair_id}/*", glob: true))
-        }
-
-        BOLTZ_PREDICT(boltz_split_ch.compute)
-        pred_results = cached_boltz.mix(BOLTZ_PREDICT.out.results)
+        BOLTZ_PREDICT(predict_ch)
+        pred_results = BOLTZ_PREDICT.out.results
     } else {
-        // --- Structure caching: skip pairs with an already-published
-        // result (e.g. a task that completed on disk but was orphaned by a
-        // killed/failed driver before Nextflow could record/publish it).
-        predict_ch.branch {
-            cached:  file("${params.outdir}/structures_af3/${it[0]}/${it[0]}_summary_confidences.json").exists()
-            compute: true
-        }.set { af3_split_ch }
-
-        cached_af3 = af3_split_ch.cached.map { pair_id, json_file, a3m_files ->
-            tuple(pair_id, file("${params.outdir}/structures_af3/${pair_id}/*", glob: true))
-        }
-
-        AF3_PREDICT(af3_split_ch.compute)
-        pred_results = cached_af3.mix(AF3_PREDICT.out.results)
+        AF3_PREDICT(predict_ch)
+        pred_results = AF3_PREDICT.out.results
     }
+
 
     // ---------------------------------------------------------------
     // Stage 6: Parse metrics per pair (pDockQ + confidence)
@@ -359,11 +480,13 @@ workflow {
         all_metrics = PARSE_METRICS_AF3.out.metrics.collect()
     }
 
+
     // ---------------------------------------------------------------
     // Stage 7: Aggregate and rank all predictions
     // ---------------------------------------------------------------
     RANK_PREDICTIONS(all_metrics)
 }
+
 
 workflow.onComplete {
     log.info """

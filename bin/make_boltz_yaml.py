@@ -39,9 +39,9 @@ import yaml
 
 
 def load_ptms_from_csv(csv_path, protein_id):
-    """Load PTMs for a specific protein from a CSV file.
+    """Load PTMs for a specific protein from one PTM table.
 
-    CSV format: protein_id,position,ccd
+    Format: protein_id,position,ccd -- tab- or comma-separated (sniffed).
     Returns a list of {"position": int, "ccd": str} dicts, or empty list.
     """
     if csv_path is None or csv_path.lower() in ("none", "null", "no_file", ""):
@@ -51,8 +51,13 @@ def load_ptms_from_csv(csv_path, protein_id):
         return []
 
     ptms = []
-    with open(csv_path) as fh:
-        reader = csv.DictReader(fh)
+    with open(csv_path, newline="") as fh:
+        # Sniff the delimiter rather than assuming a comma: the canonical
+        # file is ptms.tsv, but a comma-separated table is equally valid.
+        first = fh.readline()
+        fh.seek(0)
+        delim = "\t" if "\t" in first else ","
+        reader = csv.DictReader(fh, delimiter=delim)
 
         # Validate header
         required = {"protein_id", "position", "ccd"}
@@ -80,11 +85,47 @@ def load_ptms_from_csv(csv_path, protein_id):
                 continue
             ptms.append({"position": pos, "ccd": ccd})
 
-    if ptms:
-        print(f"  {protein_id}: {len(ptms)} PTM(s) loaded from {csv_path}",
-              file=sys.stderr)
     return ptms
 
+
+_PTM_KEY = lambda p: (p["position"], p["ccd"])
+
+def _ptm_sources(spec):
+    """Split a --ptms value into real file paths.
+
+    The value is one path or a comma-separated list. 'no_file'/'none'/'' mean
+    no PTMs. Missing files are skipped silently, matching the previous
+    behaviour of the per-role loaders.
+    """
+    if not spec:
+        return []
+    out = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part or part.lower() in ("none", "null", "no_file"):
+            continue
+        if os.path.isfile(part):
+            out.append(part)
+    return out
+
+
+def load_ptms(spec, protein_id):
+    """Resolve a protein's PTMs by ID across every supplied PTM file.
+
+    Keyed on protein_id ALONE.
+    
+    Accepts a comma-separated list of tables as well as a single file;
+    results are unioned and de-duplicated on (position, ccd).
+    """
+    merged = {}
+    for path in _ptm_sources(spec):
+        for ptm in load_ptms_from_csv(path, protein_id):
+            merged.setdefault(_PTM_KEY(ptm), (ptm, path))
+    if merged:
+        srcs = sorted({p for _, p in merged.values()})
+        print(f"  {protein_id}: {len(merged)} PTM(s) loaded from "
+              f"{', '.join(srcs)}", file=sys.stderr)
+    return [ptm for ptm, _ in merged.values()]
 
 def validate_ptms(ptms, sequence, label):
     """Validate that PTM positions fall within the sequence."""
@@ -120,10 +161,10 @@ def main():
     parser.add_argument("--candidate-id", required=True, help="Candidate protein ID")
     parser.add_argument("--candidate-seq", required=True, help="Candidate protein sequence")
     parser.add_argument("--candidate-msa", default=None, help="Path to candidate MSA CSV")
-    parser.add_argument("--bait-ptms", default=None,
-                        help="Path to bait PTM CSV (columns: protein_id,position,ccd)")
-    parser.add_argument("--candidate-ptms", default=None,
-                        help="Path to candidate PTM CSV (columns: protein_id,position,ccd)")
+    parser.add_argument("--ptms", default=None,
+                        help="PTM table (protein_id,position,ccd), or a "
+                             "comma-separated list of them. Resolved by "
+                             "protein ID, not by bait/candidate role.")
     parser.add_argument("--output", "-o", required=True, help="Output YAML file")
     args = parser.parse_args()
 
@@ -136,8 +177,8 @@ def main():
                   file=sys.stderr)
 
     # Load PTMs from optional CSV files
-    bait_ptms = load_ptms_from_csv(args.bait_ptms, args.bait_id)
-    candidate_ptms = load_ptms_from_csv(args.candidate_ptms, args.candidate_id)
+    bait_ptms = load_ptms(args.ptms, args.bait_id)
+    candidate_ptms = load_ptms(args.ptms, args.candidate_id)
 
     # Validate PTM positions against sequences
     validate_ptms(bait_ptms, args.bait_seq, "bait")

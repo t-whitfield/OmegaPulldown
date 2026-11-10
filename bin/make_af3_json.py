@@ -3,22 +3,29 @@
 Generate an AlphaFold 3 JSON input file for a protein-protein pair.
 
 Creates a version-2 JSON that references pre-computed A3M MSA files via
-unpairedMsaPath, allowing AF3 to run with --norun_data_pipeline.
+unpairedMsaPath and pairedMsaPath, allowing AF3 to run with
+--norun_data_pipeline.
 
 Each protein chain specifies:
-  - unpairedMsaPath: relative path to the A3M file
-  - pairedMsa: "" (empty; no paired MSA)
+  - unpairedMsaPath: relative path to the unpaired A3M file (UniRef90 +
+    MGnify + Small BFD, merged, deduplicated)
+  - pairedMsaPath: relative path to the paired A3M file (UniProt search,
+    full original headers preserved). AF3 does its own species-based
+    bait/candidate row matching internally from this file's headers.
   - templates: [] (empty; no structural templates)
+
+AF3 requires unpairedMsaPath/pairedMsaPath/templates to be either all unset
+or all set, so pairedMsaPath is not optional once unpairedMsaPath is provided.
 
 Post-translational modifications use ptmType/ptmPosition fields
 in the AF3 JSON format.
 
 Usage:
   make_af3_json.py \
-      --bait-id Wnt3a --bait-seq SYPIWW... --bait-msa Wnt3a.a3m \
-      --candidate-id xCres --candidate-seq MYLDFF... --candidate-msa xCres.a3m \
-      --bait-ptms bait_ptms.csv \
-      --seeds 42 --output Wnt3a_with_xCres.json
+      --bait-id protA --bait-seq SYPIWW... --bait-msa protA.a3m \
+      --candidate-id protB --candidate-seq MYLDFF... --candidate-msa protB.a3m \
+      --ptms ptms.tsv \
+      --seeds 42 --output protA_with_protB.json
 """
 
 import argparse
@@ -29,9 +36,9 @@ import sys
 
 
 def load_ptms_from_csv(csv_path, protein_id):
-    """Load PTMs for a specific protein from a CSV file.
+    """Load PTMs for a specific protein from one PTM table.
 
-    CSV format: protein_id,position,ccd
+    Format: protein_id,position,ccd: tab- or comma-separated (checked).
     Returns a list of {"ptmType": str, "ptmPosition": int} dicts for AF3.
     """
     if csv_path is None or csv_path.lower() in ("none", "null", "no_file", ""):
@@ -41,8 +48,13 @@ def load_ptms_from_csv(csv_path, protein_id):
         return []
 
     ptms = []
-    with open(csv_path) as fh:
-        reader = csv.DictReader(fh)
+    with open(csv_path, newline="") as fh:
+        # Check the delimiter rather than assuming a comma: the canonical
+        # file is ptms.tsv, but a comma-separated table is equally valid.
+        first = fh.readline()
+        fh.seek(0)
+        delim = "\t" if "\t" in first else ","
+        reader = csv.DictReader(fh, delimiter=delim)
 
         required = {"protein_id", "position", "ccd"}
         if not required.issubset(set(reader.fieldnames or [])):
@@ -69,11 +81,47 @@ def load_ptms_from_csv(csv_path, protein_id):
                 continue
             ptms.append({"ptmType": ccd, "ptmPosition": pos})
 
-    if ptms:
-        print(f"  {protein_id}: {len(ptms)} PTM(s) loaded from {csv_path}",
-              file=sys.stderr)
     return ptms
 
+
+_PTM_KEY = lambda p: (p["ptmPosition"], p["ptmType"])
+
+def _ptm_sources(spec):
+    """Split a --ptms value into real file paths.
+
+    The value is one path or a comma-separated list. 'no_file'/'none'/'' mean
+    no PTMs. Missing files are skipped silently, matching the previous
+    behaviour of the per-role loaders.
+    """
+    if not spec:
+        return []
+    out = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part or part.lower() in ("none", "null", "no_file"):
+            continue
+        if os.path.isfile(part):
+            out.append(part)
+    return out
+
+
+def load_ptms(spec, protein_id):
+    """Resolve a protein's PTMs by ID across every supplied PTM file.
+
+    Keyed on protein_id alone.
+    
+    Accepts a comma-separated list of tables as well as a single file;
+    results are unioned and de-duplicated on (position, ccd).
+    """
+    merged = {}
+    for path in _ptm_sources(spec):
+        for ptm in load_ptms_from_csv(path, protein_id):
+            merged.setdefault(_PTM_KEY(ptm), (ptm, path))
+    if merged:
+        srcs = sorted({p for _, p in merged.values()})
+        print(f"  {protein_id}: {len(merged)} PTM(s) loaded from "
+              f"{', '.join(srcs)}", file=sys.stderr)
+    return [ptm for ptm, _ in merged.values()]
 
 def validate_ptms(ptms, sequence, label):
     """Validate that PTM positions fall within the sequence."""
@@ -204,7 +252,7 @@ def patch_a3m_query(a3m_path, ptm_positions, output_path):
           file=sys.stderr)
 
 
-def build_protein_entry(chain_id, sequence, msa_path=None, ptms=None):
+def build_protein_entry(chain_id, sequence, msa_path=None, paired_msa_path=None, ptms=None):
     """Build a single protein entry for the AF3 JSON."""
     entry = {
         "id": chain_id,
@@ -214,7 +262,7 @@ def build_protein_entry(chain_id, sequence, msa_path=None, ptms=None):
         entry["modifications"] = ptms
     if msa_path is not None:
         entry["unpairedMsaPath"] = msa_path
-        entry["pairedMsa"] = ""
+        entry["pairedMsaPath"] = paired_msa_path
         entry["templates"] = []
     return {"protein": entry}
 
@@ -225,14 +273,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bait-id", required=True, help="Bait protein ID")
     parser.add_argument("--bait-seq", required=True, help="Bait protein sequence")
-    parser.add_argument("--bait-msa", default=None, help="Path to bait A3M MSA file")
+    parser.add_argument("--bait-msa", default=None, help="Path to bait unpaired A3M MSA file")
+    parser.add_argument("--bait-paired-msa", default=None, help="Path to bait paired (UniProt) A3M MSA file")
     parser.add_argument("--candidate-id", required=True, help="Candidate protein ID")
     parser.add_argument("--candidate-seq", required=True, help="Candidate protein sequence")
-    parser.add_argument("--candidate-msa", default=None, help="Path to candidate A3M MSA file")
-    parser.add_argument("--bait-ptms", default=None,
-                        help="Path to bait PTM CSV (columns: protein_id,position,ccd)")
-    parser.add_argument("--candidate-ptms", default=None,
-                        help="Path to candidate PTM CSV (columns: protein_id,position,ccd)")
+    parser.add_argument("--candidate-msa", default=None, help="Path to candidate unpaired A3M MSA file")
+    parser.add_argument("--candidate-paired-msa", default=None, help="Path to candidate paired (UniProt) A3M MSA file")
+    parser.add_argument("--ptms", default=None,
+                        help="PTM table (protein_id,position,ccd), or a "
+                             "comma-separated list of them. Resolved by "
+                             "protein ID, not by bait/candidate role.")
     parser.add_argument("--seeds", default="42",
                         help="Comma-separated model seeds (default: 42)")
     parser.add_argument("--output", "-o", required=True, help="Output JSON file")
@@ -250,8 +300,8 @@ def main():
     seeds = [int(s.strip()) for s in args.seeds.split(",")]
 
     # Load PTMs
-    bait_ptms = load_ptms_from_csv(args.bait_ptms, args.bait_id)
-    candidate_ptms = load_ptms_from_csv(args.candidate_ptms, args.candidate_id)
+    bait_ptms = load_ptms(args.ptms, args.bait_id)
+    candidate_ptms = load_ptms(args.ptms, args.candidate_id)
 
     validate_ptms(bait_ptms, args.bait_seq, "bait")
     validate_ptms(candidate_ptms, args.candidate_seq, "candidate")
@@ -299,6 +349,28 @@ def main():
             patch_a3m_query(cleaned_name, ptm_positions, cleaned_name)
         cand_msa_ref = cleaned_name
 
+    # Paired (UniProt) A3Ms get the same cleaning/patching treatment as the
+    # unpaired ones above: their first row is also the query sequence, and
+    # AF3 requires the MSA query row to match its internal X-substituted
+    # sequence for any chain with PTMs.
+    bait_paired_msa_ref = os.path.basename(args.bait_paired_msa) if args.bait_paired_msa else None
+    if args.bait_paired_msa:
+        cleaned_name = os.path.basename(args.bait_paired_msa).replace(".a3m", "_af3.a3m")
+        clean_a3m_for_af3(args.bait_paired_msa, cleaned_name)
+        if bait_ptms:
+            ptm_positions = {p["ptmPosition"] for p in bait_ptms}
+            patch_a3m_query(cleaned_name, ptm_positions, cleaned_name)
+        bait_paired_msa_ref = cleaned_name
+
+    cand_paired_msa_ref = os.path.basename(args.candidate_paired_msa) if args.candidate_paired_msa else None
+    if args.candidate_paired_msa:
+        cleaned_name = os.path.basename(args.candidate_paired_msa).replace(".a3m", "_af3.a3m")
+        clean_a3m_for_af3(args.candidate_paired_msa, cleaned_name)
+        if candidate_ptms:
+            ptm_positions = {p["ptmPosition"] for p in candidate_ptms}
+            patch_a3m_query(cleaned_name, ptm_positions, cleaned_name)
+        cand_paired_msa_ref = cleaned_name
+
     # Build AF3 JSON (version 2 enables external MSA fields)
     af3_input = {
         "dialect": "alphafold3",
@@ -309,11 +381,13 @@ def main():
             build_protein_entry(
                 "A", args.bait_seq,
                 msa_path=bait_msa_ref,
+                paired_msa_path=bait_paired_msa_ref,
                 ptms=bait_ptms if bait_ptms else None,
             ),
             build_protein_entry(
                 "B", args.candidate_seq,
                 msa_path=cand_msa_ref,
+                paired_msa_path=cand_paired_msa_ref,
                 ptms=candidate_ptms if candidate_ptms else None,
             ),
         ],

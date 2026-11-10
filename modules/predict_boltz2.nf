@@ -28,10 +28,9 @@ process BOLTZ_PREDICT {
                         ? "--msa_server_url ${params.msa_server_url}" : ""
     def potentials    = params.use_potentials ? "--use_potentials" : ""
     """
-    # Reduces CUDA allocator fragmentation (not a VRAM-ceiling extension like
-    # AF3_PREDICT's unified-memory env vars since Boltz-2 is PyTorch-based, no
-    # JAX involved). Won't rescue a genuine over-capacity OOM, but is a safe,
-    # low-cost hedge against fragmentation-induced false OOMs.
+    # The setting below reduces CUDA allocator fragmentation: it won't
+    # rescue a genuine OOM, but is a safe, low-cost hedge against
+    # fragmentation-induced false OOMs.
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
     boltz predict ${yaml_file} \
@@ -43,5 +42,16 @@ process BOLTZ_PREDICT {
         ${potentials} \
         ${msa_flag} \
         ${msa_url}
+    """
+
+    stub:
+    // No conda/GPU invocation: this needs a real Boltz-2 environment and
+    // GPU, neither is appropriate for a stub-run on the head node. Minimal
+    // placeholder output matching what PARSE_METRICS (rank.nf) globs for:
+    // confidence_*.json, *.cif.
+    """
+    mkdir -p boltz_out/boltz_results_${pair_id}/predictions/${pair_id}
+    echo '{"confidence_score": 0.5, "ptm": 0.5, "iptm": 0.5, "protein_iptm": 0.5}' > boltz_out/boltz_results_${pair_id}/predictions/${pair_id}/confidence_${pair_id}_model_0.json
+    touch boltz_out/boltz_results_${pair_id}/predictions/${pair_id}/${pair_id}_model_0.cif
     """
 }
