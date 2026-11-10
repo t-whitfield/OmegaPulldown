@@ -4,7 +4,24 @@ Structure-based protein–protein interaction screening with [Boltz-2](https://g
 
 Analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu et al., *Bioinformatics* 2023) but built on a Nextflow pipeline that runs two independently trained next-generation structure predictors under a single ranking schema.
 
-![OmegaPulldown pipeline](extras/pipeline_subway.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="extras/pipeline_subway_dark.png">
+  <img alt="OmegaPulldown pipeline" src="extras/pipeline_subway.png">
+</picture>
+
+```groovy
+manifest {
+    name            = 'OmegaPulldown'
+    author          = 'Troy Whitfield'
+    homePage        = 'https://github.com/t-whitfield/OmegaPulldown'
+    description     = 'Structure-based protein-protein interaction screening with Boltz-2 and AlphaFold 3'
+    mainScript      = 'main.nf'
+    defaultBranch   = 'main'
+    version         = '1.0.0'
+    license         = 'MIT'
+    nextflowVersion = '>=23.04.0'
+}
+```
 
 ## Features
 
@@ -158,11 +175,11 @@ OmegaPulldown/
 
 ## Requirements
 
-- [Nextflow](https://www.nextflow.io/) ≥ 22.10
+- [Nextflow](https://www.nextflow.io/) ≥ 23.04.0
 - [mmseqs2](https://github.com/soedinglab/MMseqs2) (for local MSA computation; not needed if using `use_msa_server=true` with Boltz-2)
 - [Boltz-2](https://github.com/jwohlwend/boltz) (conda environment)
 - [AlphaFold 3](https://github.com/google-deepmind/alphafold3) (Singularity container). Model weights require a [license agreement with Google DeepMind](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).
-- Python 3.9+ with numpy
+- Python 3.9+ with numpy ≥ 1.20, PyYAML ≥ 5.1, redis ≥ 4.0
 - Redis (for Boltz-2 local MSA mode only — used to serve `taxonomy.rdb` during taxonomy tagging)
 
 ## Local setup

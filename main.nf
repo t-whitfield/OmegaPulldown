@@ -20,15 +20,17 @@
  *                        bait and candidate sets are disjoint).
  *
  *    2a. (Boltz-2 local MSA, use_msa_server=false)
- *        MSA_SEARCH_DB_BOLTZ2 - UniRef30 search per unique protein (CPU),
- *        then (only if params.use_env=true) MSA_SEARCH_ENV_BOLTZ2 (to
- *        include env/metagenomic search, then MERGE_TAXONOMY_BOLTZ2 (i.e.
- *        a merge + taxonomy-ID tagging into the final per-protein CSVs
- *        (see modules/search_msa_boltz2.nf).
+ *        MSA_SEARCH_DB_BOLTZ2, UniRef30 search per unique protein (CPU);
+ *        then (only if params.use_env=true) MSA_SEARCH_ENV_BOLTZ2,
+ *        env/metagenomic search; then MERGE_TAXONOMY_BOLTZ2, merge +
+ *        taxonomy-ID tagging into the final per-protein CSVs (see
+ *        modules/search_msa_boltz2.nf). No separate pairing/join step:
+ *        Boltz-2's own featurizer pairs rows sharing a taxonomy ID across
+ *        whichever two chains' CSVs are loaded for a prediction.
  *
  *    2b. (AF3-native MSA, predictor=alphafold3)
- *        MSA_SEARCH_DB - one task per unpaired database (UniRef90, MGnify,
- *        Small BFD), then MERGE_AF3_NATIVE_MSA: merge with exact-duplicate
+ *        MSA_SEARCH_DB, one task per unpaired database (UniRef90, MGnify,
+ *        Small BFD); then MERGE_AF3_NATIVE_MSA, merge with exact-duplicate
  *        removal into one unpaired a3m per protein. Separately,
  *        MSA_SEARCH_UNIPROT_PAIRED builds the PAIRED a3m from UniProt, which
  *        AF3 keeps distinct from the unpaired MSA and uses for cross-chain
@@ -44,7 +46,7 @@
  *    --predictor boltz2       (default)
  *    --predictor alphafold3
  *
- *  MSA caching: NOTE the two predictors cache different files:
+ *  MSA caching -- NOTE the two predictors cache different files:
  *    predictor=boltz2 caches per-protein CSVs at
  *      params.alignments_dir_boltz2/csv/<prot_id>.csv
  *    There is no a3m-level cache for Boltz-2: taxonomy tagging happens in
@@ -68,8 +70,8 @@
  *      BAIT1_GFP	18	SEP
  *
  *  Usage:
- *    # Boltz-2 (default), API-based MSA (use_msa_server=true is the default
- *    # and recommended unless running a large all-vs-all screen, see
+ *    # Boltz-2 (default), API-based MSA (use_msa_server=true is the default --
+ *    # recommended unless running a large all-vs-all screen, see
  *    # boltz2_uniref30_db/taxonomy_rdb in nextflow.config for the local-MSA
  *    # alternative)
  *    nextflow run main.nf \
@@ -100,8 +102,8 @@
  *    # Pair-list mode: predict ONLY the pairs named in a file, e.g. to add a
  *    # structure-based ranking to PPIs reported by proteomics. The first two
  *    # columns are protein IDs (header auto-detected); --sequences_fasta must
- *    # hold every protein the list names. baits_fasta/candidates_fasta are
- *    # ignored.
+ *    # hold every protein the list names. The --baits_fasta and
+ *    # --candidates_fasta flags are ignored in this mode.
  *    nextflow run main.nf \
  *      --pairs_tsv ms_hits.tsv \
  *      --sequences_fasta all_proteins.fasta
@@ -121,10 +123,10 @@ nextflow.enable.dsl = 2
 include { MSA_SEARCH_DB_BOLTZ2; MSA_SEARCH_ENV_BOLTZ2; MERGE_TAXONOMY_BOLTZ2 }                 from './modules/search_msa_boltz2'
 include { MSA_SEARCH_DB; MERGE_AF3_NATIVE_MSA; MSA_SEARCH_UNIPROT_PAIRED }                     from './modules/search_msa_af3'
 include { GENERATE_PAIRS; MAKE_BOLTZ_YAML; MAKE_BOLTZ_YAML_NO_MSA }   from './modules/prepare_input'
-include { BOLTZ_PREDICT }                                              from './modules/predict_boltz2'
-include { PARSE_METRICS; RANK_PREDICTIONS }                            from './modules/rank'
-include { MAKE_AF3_JSON; AF3_PREDICT }                                 from './modules/predict_af3'
-include { PARSE_METRICS_AF3 }                                          from './modules/rank_af3'
+include { BOLTZ_PREDICT }                                             from './modules/predict_boltz2'
+include { PARSE_METRICS; RANK_PREDICTIONS }                           from './modules/rank'
+include { MAKE_AF3_JSON; AF3_PREDICT }                                from './modules/predict_af3'
+include { PARSE_METRICS_AF3 }                                         from './modules/rank_af3'
 
 
 /*
@@ -159,7 +161,7 @@ def parseFasta(fastaPath) {
  *
  * ONE ID-keyed table, conventionally ptms.tsv:
  *   protein_id<TAB>position<TAB>ccd
- * Tab- or comma-separated. Resolution by protein ID alone, never
+ * Tab- or comma-separated. Resolution by protein ID alone -- never
  * by whether a protein is the bait or the candidate of a given pair.
  *
  * Priority:
@@ -489,16 +491,69 @@ workflow {
 
 
 workflow.onComplete {
-    log.info """
-    =========================================================================
-    OmegaPulldown complete
-    =========================================================================
-    Predictor  : ${params.predictor}
-    Status     : ${workflow.success ? 'SUCCESS' : 'FAILED'}
-    Duration   : ${workflow.duration}
-    Output     : ${params.outdir}
-    Structures : ${params.outdir}/structures_${params.predictor}/
-    Rankings   : ${params.outdir}/rankings_${params.predictor}.tsv
-    =========================================================================
-    """.stripIndent()
+
+    // -------------------------------------------------------------------
+    // Reconcile pairs enumerated against pairs actually ranked.
+    //
+    // The deliberate process-wide errorStrategy in nextflow.config is
+    //   { task.attempt <= 2 ? 'retry' : 'ignore' }
+    // on a several-hundred-candidate screen, one pair prediction that has
+    // and OOM must not take the rest of the run down with it. The cost of
+    // 'ignore' is that workflow.success stays true no matter how many
+    // predictions were dropped.
+    //
+    // So count rows rather than trust the exit status. Both files carry a
+    // header row, hence the -1. A null return means the file is absent,
+    // which for the rankings file IS the diagnosis.
+    // -------------------------------------------------------------------
+    def dataRows = { pathStr ->
+        def f = file(pathStr)
+        f.exists() ? Math.max(0, f.readLines().count { it.trim() } - 1) : null
+    }
+
+    def n_pairs  = dataRows("${params.outdir}/pairs/pairs.tsv")
+    def n_ranked = dataRows("${params.outdir}/rankings_${params.predictor}.tsv")
+
+    // workflow.stats.ignoredCount counts TASKS swallowed by 'ignore', not
+    // pairs: a pair that failed, retried twice and was then dropped
+    // contributes one ignored task, and a pair can also be lost in
+    // PARSE_METRICS rather than in prediction. Report it as a pointer to
+    // the trace file, not as a pair count: n_pairs/n_ranked above are the
+    // pair-level numbers.
+    def n_ignored = workflow.stats.ignoredCount
+
+    def status
+    if (!workflow.success)
+        // A real pipeline failure (not an ignored task): Nextflow has
+        // already printed the cause above.
+        status = 'FAILED'
+    else if (n_pairs == null)
+        // No pairs.tsv published, so there is nothing to reconcile against,
+        // e.g. GENERATE_PAIRS itself was the thing that died.
+        status = 'SUCCESS (no pair list found to reconcile against)'
+    else if (n_ranked == null)
+        status = "FAILED - no rankings written (0 of ${n_pairs} pairs ranked)"
+    else if (n_ranked < n_pairs)
+        status = "INCOMPLETE - ${n_ranked} of ${n_pairs} pairs ranked, ${n_pairs - n_ranked} dropped"
+    else
+        status = "SUCCESS - ${n_ranked} of ${n_pairs} pairs ranked"
+
+    // Assembled line by line rather than as one GString so the optional
+    // "Dropped" line can be omitted without leaving a blank row or
+    // disturbing stripIndent()'s common-prefix calculation.
+    def lines = []
+    lines << '========================================================================='
+    lines << 'OmegaPulldown complete'
+    lines << '========================================================================='
+    lines << "Predictor  : ${params.predictor}"
+    lines << "Status     : ${status}"
+    lines << "Duration   : ${workflow.duration}"
+    if (n_ignored > 0)
+        lines << "Dropped    : ${n_ignored} task(s) failed after retries and were ignored"
+    lines << "Output     : ${params.outdir}"
+    lines << "Structures : ${params.outdir}/structures_${params.predictor}/"
+    lines << "Rankings   : ${params.outdir}/rankings_${params.predictor}.tsv"
+    lines << '========================================================================='
+
+    log.info '\n' + lines.collect { '    ' + it }.join('\n') + '\n'
 }
