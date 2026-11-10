@@ -9,20 +9,6 @@ Analogous to [AlphaPulldown](https://github.com/KosinskiLab/AlphaPulldown) (Yu e
   <img alt="OmegaPulldown pipeline" src="extras/pipeline_subway.png">
 </picture>
 
-```groovy
-manifest {
-    name            = 'OmegaPulldown'
-    author          = 'Troy Whitfield'
-    homePage        = 'https://github.com/t-whitfield/OmegaPulldown'
-    description     = 'Structure-based protein-protein interaction screening with Boltz-2 and AlphaFold 3'
-    mainScript      = 'main.nf'
-    defaultBranch   = 'main'
-    version         = '1.0.0'
-    license         = 'MIT'
-    nextflowVersion = '>=23.04.0'
-}
-```
-
 ## Features
 
 - **Bait × candidate screening** — one-vs-many or many-vs-many, from two FASTA files

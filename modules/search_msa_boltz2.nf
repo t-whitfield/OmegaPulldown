@@ -9,7 +9,7 @@
  *   2. MSA_SEARCH_ENV_BOLTZ2 -- env/metagenomic search only
  *      (process_mmseqs_bigmem, 800GB). Only invoked when params.use_env=true
  *      (see main.nf): this is the only piece of the chain that needs a
- *      typlically scarce bigmem-class node.
+ *      typically scarce bigmem-class node.
  *   3. MERGE_TAXONOMY_BOLTZ2 -- merges UniRef30 + env a3ms (or passes
  *      UniRef30 through untouched when env didn't run) and does the
  *      taxonomy-ID tagging + CSV write (process_medium, 128GB).
